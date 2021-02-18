@@ -127,6 +127,14 @@
 #include "android-base/parseint.h"
 #include "android-base/stringprintf.h"
 
+#ifdef QCOM_UM_FAMILY
+#if __has_include("QtiGralloc.h")
+#include "QtiGralloc.h"
+#else
+#include "gralloc_priv.h"
+#endif
+#endif
+
 #define MAIN_THREAD ACQUIRE(mStateLock) RELEASE(mStateLock)
 
 #define ON_MAIN_THREAD(expr)                                       \
@@ -2579,6 +2587,11 @@ void SurfaceFlinger::processDisplayAdded(const wp<IBinder>& displayToken,
                                          const DisplayDeviceState& state) {
     int width = 0;
     int height = 0;
+#ifdef QCOM_UM_FAMILY
+    bool canAllocateHwcForVDS = false;
+#else
+    bool canAllocateHwcForVDS = true;
+#endif
     ui::PixelFormat pixelFormat = static_cast<ui::PixelFormat>(PIXEL_FORMAT_UNKNOWN);
     if (state.physical) {
         const auto& activeConfig =
@@ -2595,6 +2608,21 @@ void SurfaceFlinger::processDisplayAdded(const wp<IBinder>& displayToken,
         status = state.surface->query(NATIVE_WINDOW_FORMAT, &intPixelFormat);
         ALOGE_IF(status != NO_ERROR, "Unable to query format (%d)", status);
         pixelFormat = static_cast<ui::PixelFormat>(intPixelFormat);
+#ifdef QCOM_UM_FAMILY
+        if (mUseHwcVirtualDisplays || getHwComposer().isUsingVrComposer()) {
+            if (maxVirtualDisplaySize == 0 ||
+                ((uint64_t)width <= maxVirtualDisplaySize &&
+                (uint64_t)height <= maxVirtualDisplaySize)) {
+                uint64_t usage = 0;
+                // Replace with native_window_get_consumer_usage ?
+                status = state .surface->getConsumerUsage(&usage);
+                ALOGW_IF(status != NO_ERROR, "Unable to query usage (%d)", status);
+                if ((status == NO_ERROR) && canAllocateHwcDisplayIdForVDS(usage)) {
+                   canAllocateHwcForVDS = true;
+               }
+            }
+        }
+#endif
     } else {
         // Virtual displays without a surface are dormant:
         // they have external state (layer stack, projection,
@@ -2611,7 +2639,8 @@ void SurfaceFlinger::processDisplayAdded(const wp<IBinder>& displayToken,
     builder.setIsSecure(state.isSecure);
     builder.setLayerStackId(state.layerStack);
     builder.setPowerAdvisor(&mPowerAdvisor);
-    builder.setUseHwcVirtualDisplays(mUseHwcVirtualDisplays || getHwComposer().isUsingVrComposer());
+    builder.setUseHwcVirtualDisplays((mUseHwcVirtualDisplays && canAllocateHwcForVDS) ||
+                                     getHwComposer().isUsingVrComposer());
     builder.setName(state.displayName);
     const auto compositionDisplay = getCompositionEngine().createDisplay(builder.build());
 
@@ -2625,8 +2654,9 @@ void SurfaceFlinger::processDisplayAdded(const wp<IBinder>& displayToken,
 
     if (state.isVirtual()) {
         sp<VirtualDisplaySurface> vds =
-                new VirtualDisplaySurface(getHwComposer(), displayId, state.surface, bqProducer,
-                                          bqConsumer, state.displayName);
+                new VirtualDisplaySurface(getHwComposer(), displayId, state.surface,
+                                          bqProducer, bqConsumer, state.displayName,
+                                          state.isSecure);
 
         displaySurface = vds;
         producer = vds;
@@ -5436,6 +5466,15 @@ status_t SurfaceFlinger::captureScreen(const sp<IBinder>& displayToken,
         display = getDisplayDeviceLocked(displayToken);
         if (!display) return NAME_NOT_FOUND;
 
+        if (display->isPrimary()) {
+            const auto physicalOrientation = display->getPhysicalOrientation();
+            renderAreaRotation = ui::Transform::toRotationFlags(rotation + physicalOrientation);
+            if (renderAreaRotation == ui::Transform::ROT_INVALID) {
+                ALOGE("%s: Invalid rotation: %s", __FUNCTION__, toCString(rotation));
+                renderAreaRotation = ui::Transform::ROT_0;
+            }
+        }
+
         // set the requested width/height to the logical display viewport size
         // by default
         if (reqWidth == 0 || reqHeight == 0) {
@@ -5509,6 +5548,7 @@ status_t SurfaceFlinger::captureScreen(uint64_t displayOrLayerStack, Dataspace* 
     uint32_t width;
     uint32_t height;
     ui::Transform::RotationFlags captureOrientation;
+    ui::Rotation correctOrientation;
     {
         Mutex::Autolock lock(mStateLock);
         display = getDisplayByIdOrLayerStack(displayOrLayerStack);
@@ -5520,7 +5560,31 @@ status_t SurfaceFlinger::captureScreen(uint64_t displayOrLayerStack, Dataspace* 
         height = uint32_t(display->getViewport().height());
 
         const auto orientation = display->getOrientation();
-        captureOrientation = ui::Transform::toRotationFlags(orientation);
+        const auto physicalOrientation = display->getPhysicalOrientation();
+        if (display->isPrimary()) {
+            switch (physicalOrientation) {
+            case ui::Rotation::Rotation0:
+                correctOrientation = orientation;
+                break;
+            case ui::Rotation::Rotation90:
+                correctOrientation = orientation + ui::Rotation::Rotation270;
+                break;
+
+            case ui::Rotation::Rotation180:
+                correctOrientation = orientation + ui::Rotation::Rotation180;
+                break;
+
+            case ui::Rotation::Rotation270:
+                correctOrientation = orientation + ui::Rotation::Rotation90;
+                break;
+
+            default:
+                break;
+            }
+            captureOrientation = ui::Transform::toRotationFlags(correctOrientation);
+        } else {
+            captureOrientation = ui::Transform::toRotationFlags(orientation);
+        }
 
         switch (captureOrientation) {
             case ui::Transform::ROT_90:
@@ -6055,6 +6119,26 @@ status_t SurfaceFlinger::setDesiredDisplayConfigSpecsInternal(
 
     return NO_ERROR;
 }
+
+#ifdef QCOM_UM_FAMILY
+bool SurfaceFlinger::canAllocateHwcDisplayIdForVDS(uint64_t usage) {
+    uint64_t flag_mask_pvt_wfd = ~0;
+    uint64_t flag_mask_hw_video = ~0;
+    char value[PROPERTY_VALUE_MAX] = {};
+    property_get("vendor.display.vds_allow_hwc", value, "0");
+    int allowHwcForVDS = atoi(value);
+    // Reserve hardware acceleration for WFD use-case
+    // GRALLOC_USAGE_PRIVATE_WFD + GRALLOC_USAGE_HW_VIDEO_ENCODER = WFD using HW composer.
+    flag_mask_pvt_wfd = GRALLOC_USAGE_PRIVATE_WFD;
+    flag_mask_hw_video = GRALLOC_USAGE_HW_VIDEO_ENCODER;
+    return (allowHwcForVDS || ((usage & flag_mask_pvt_wfd) &&
+            (usage & flag_mask_hw_video)));
+}
+#else
+bool SurfaceFlinger::canAllocateHwcDisplayIdForVDS(uint64_t) {
+    return true;
+}
+#endif
 
 status_t SurfaceFlinger::setDesiredDisplayConfigSpecs(const sp<IBinder>& displayToken,
                                                       int32_t defaultConfig,
